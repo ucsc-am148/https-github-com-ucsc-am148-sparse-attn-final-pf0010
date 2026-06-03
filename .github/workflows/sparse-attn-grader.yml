@@ -1,0 +1,174 @@
+# Block-sparse attention autograder -- POSTs the student's kernels.py to the
+# Modal grader endpoint and posts the grade (points / 50) as a commit comment.
+#
+# This workflow lives in a GitHub Classroom assignment template. When a student
+# accepts the assignment, Classroom creates a fresh private repo from this
+# template; the workflow runs on every push to main against THAT student's repo,
+# with secrets inherited from the Classroom.
+#
+# Submission cap: 40 graded runs per repo (= per student). We count past commit
+# comments tagged with the marker below.
+#
+# Required secrets (set at the Classroom level so they propagate to every repo):
+#   MODAL_GRADER_URL   -- deployed endpoint, e.g. https://<ws>--sparse-attn-grade.modal.run
+#   MODAL_AUTH_TOKEN   -- matches AUTH_TOKEN in the Modal secret sparse-attn-grader-token
+
+name: Block-sparse attention autograder
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - kernels.py
+  workflow_dispatch:
+
+permissions:
+  contents: write    # required to post commit comments
+
+concurrency:
+  group: sparse-attn-grader-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+    env:
+      MARKER: "<!-- sparse-attn-autograder-result -->"
+      CAP_MARKER: "<!-- sparse-attn-autograder-cap -->"
+      MAX_SUBMISSIONS: 40
+      REPO: ${{ github.repository }}
+      SHA: ${{ github.sha }}
+      HANDLE: ${{ github.actor }}
+
+    steps:
+      - name: Count past graded submissions
+        id: cap
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          count=$(gh api "/repos/$REPO/comments" --paginate \
+            --jq "[.[] | select(.body | contains(\"$MARKER\"))] | length" \
+            | awk '{ s += $1 } END { print s+0 }')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to grade
+        id: gate
+        run: |
+          if [ "${{ steps.cap.outputs.count }}" -ge "$MAX_SUBMISSIONS" ]; then
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment that submission cap is reached
+        if: steps.gate.outputs.go == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          existing=$(gh api "/repos/$REPO/comments" --paginate \
+            --jq "[.[] | select(.body | contains(\"$CAP_MARKER\"))] | length" \
+            | awk '{ s += $1 } END { print s+0 }')
+          if [ "$existing" = "0" ]; then
+            cat > /tmp/cap_body.md <<EOF
+          $CAP_MARKER
+          ## Block-sparse attention autograder
+
+          Submission cap reached ($MAX_SUBMISSIONS / $MAX_SUBMISSIONS).
+
+          You've used all your graded runs. If you believe an additional attempt
+          is warranted, contact the instructor for a manual extension.
+          EOF
+            jq -n --rawfile body /tmp/cap_body.md '{body: $body}' > /tmp/cap_payload.json
+            gh api -X POST "/repos/$REPO/commits/$SHA/comments" --input /tmp/cap_payload.json
+          fi
+
+      - name: Fetch student kernels.py
+        if: steps.gate.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "/repos/$REPO/contents/kernels.py?ref=$SHA" \
+            --jq '.content' | base64 -d > /tmp/student_kernels.py
+          test -s /tmp/student_kernels.py
+          echo "Fetched kernels.py: $(wc -l < /tmp/student_kernels.py) lines."
+
+      - name: Submit to Modal grader
+        if: steps.gate.outputs.go == 'true'
+        env:
+          MODAL_URL: ${{ secrets.MODAL_GRADER_URL }}
+          MODAL_TOKEN: ${{ secrets.MODAL_AUTH_TOKEN }}
+        run: |
+          jq -Rs --arg handle "$HANDLE" '{kernels_py: ., handle: $handle}' \
+            /tmp/student_kernels.py > /tmp/payload.json
+          # -L follows Modal's 303 redirect: a web endpoint whose work runs past
+          # the ~150s HTTP request ceiling returns a redirect that must be polled
+          # until grade_submission (timeout=600) finishes. Heavy grading (the
+          # T=4096 leaderboard do_bench) routinely exceeds 150s, so this is load-
+          # bearing; --max-time 700 bounds the whole poll.
+          http_code=$(curl -sS -L -o /tmp/grade.json -w "%{http_code}" \
+            -X POST "$MODAL_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Auth-Token: $MODAL_TOKEN" \
+            --max-time 700 \
+            -d @/tmp/payload.json)
+          if [ "$http_code" != "200" ]; then
+            echo "::error::Modal grader returned HTTP $http_code"
+            cat /tmp/grade.json || true
+            exit 1
+          fi
+
+      - name: Post grade as commit comment
+        if: steps.gate.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # A null `points` means the grader refused the request (bad auth token,
+          # missing body) rather than scoring a 0. Surface it as a job error
+          # instead of posting a misleading "0 / 50" comment to the student.
+          if [ "$(jq -r '.points' /tmp/grade.json)" = "null" ]; then
+            echo "::error::Grader returned no score: $(jq -r '.error // "unknown error"' /tmp/grade.json)"
+            exit 1
+          fi
+          remaining=$((MAX_SUBMISSIONS - ${{ steps.cap.outputs.count }} - 1))
+          points=$(jq -r '.points // 0' /tmp/grade.json)
+          maxp=$(jq -r '.max_points // 50' /tmp/grade.json)
+          summary=$(jq -r '
+            (.rungs // {}) | to_entries | map(
+              "- **" + .key + "**: " + ((.value.points // 0)|tostring) + "/"
+              + ((.value.max_points // 0)|tostring) + " pts  ·  "
+              + (if .value.passed then "PASS" else "FAIL" end)
+              + (if .value.reason and (.value.passed | not) then "  —  " + .value.reason else "" end)
+            ) | join("\n")
+          ' /tmp/grade.json)
+          lb=$(jq -r '
+            if (.leaderboard.tflops // null) != null
+            then "**Leaderboard:** " + (((.leaderboard.tflops)*100|round)/100|tostring)
+                 + " eff TFLOP/s  (best so far: "
+                 + (((.leaderboard.best_tflops // .leaderboard.tflops)*100|round)/100|tostring) + ")"
+            else "_Leaderboard: not ranked (needs passing A2 and A3)._" end
+          ' /tmp/grade.json)
+
+          {
+            echo "$MARKER"
+            echo "## Block-sparse attention autograder"
+            echo
+            echo "**Score: \`$points / $maxp\`** (code correctness; the other 50 points are the oral exam)"
+            echo
+            echo "$summary"
+            echo
+            echo "$lb"
+            echo
+            echo "---"
+            echo "Submissions remaining: $remaining / $MAX_SUBMISSIONS"
+            echo
+            echo "<details><summary>Full report (JSON)</summary>"
+            echo
+            echo '```json'
+            cat /tmp/grade.json
+            echo
+            echo '```'
+            echo "</details>"
+          } > /tmp/comment.md
+
+          jq -n --rawfile body /tmp/comment.md '{body: $body}' > /tmp/comment_payload.json
+          gh api -X POST "/repos/$REPO/commits/$SHA/comments" --input /tmp/comment_payload.json

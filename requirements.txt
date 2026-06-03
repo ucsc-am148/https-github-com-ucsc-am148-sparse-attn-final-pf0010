@@ -1,0 +1,7 @@
+# Python deps for the block-sparse attention assignment. Install with:
+#     pip install -r requirements.txt
+# Requires Python 3.10+, CUDA 12.x toolkit, and an NVIDIA GPU with fp16 tensor
+# cores (the attention rungs run tl.dot on tensor cores).
+
+torch>=2.4
+triton>=3.6
